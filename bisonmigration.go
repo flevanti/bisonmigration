@@ -29,6 +29,7 @@ type migrationRegisteredType struct {
 	down              migrationFunctionSignatureType
 	Processed         bool
 	ProcessedTimeUnix int64
+	ProcessedBatch    int
 }
 
 type MigrationsRegisteredType []migrationRegisteredType
@@ -66,6 +67,12 @@ func MigrationEngineInitialise(databaseName string, collectionName string, dbCli
 	migrationAppDatabase = databaseName
 	migrationAppCollection = collectionName
 	migrationAppMongoClient = dbClient
+
+	RefreshDataFromDb()
+
+}
+
+func RefreshDataFromDb() {
 	migrationAppDatabaseExists = databaseExists(migrationAppDatabase)
 	if migrationAppDatabaseExists {
 		migrationAppCollectionExists = collectionExists(migrationAppDatabase, migrationAppCollection)
@@ -97,8 +104,10 @@ func markMigrationsThatArePending() {
 	for i, m := range migrationsRegistered {
 		uniqueId := m.UniqueId
 		if exists, ii := checkIfUniqIdPresentInProcesseddMigrations(uniqueId); exists {
+			//enrich the registered migration with some info about its processed status
 			migrationsRegistered[i].Processed = true
 			migrationsRegistered[i].ProcessedTimeUnix = migrationsProcessed[ii].ProcessedTimeUnix
+			migrationsRegistered[i].ProcessedBatch = migrationsProcessed[ii].ProcessedBatch
 		}
 	} //end for loop
 }
@@ -138,6 +147,10 @@ func GetMigrationsPendingCount() int {
 
 func GetMigrationsRegisteredCount() int {
 	return len(migrationsRegistered)
+}
+
+func GetMigrationsRegistered() MigrationsRegisteredType {
+	return migrationsRegistered
 }
 
 func GetMigrationsProcessedCount() int {
@@ -216,7 +229,8 @@ func checkIfUniqIdPresentInProcesseddMigrations(uniqueId string) (bool, int) {
 func generateMigrationUniqueId(sequence int64, description string) string {
 
 	x := md5.Sum([]byte(description))
-	return fmt.Sprintf("%d.%x", sequence, x)
+	xShortAndString := fmt.Sprintf("%x", x)[:5]
+	return fmt.Sprintf("%d.%s", sequence, xShortAndString)
 }
 
 func checkSequenceStrictness(strictness []string) {
