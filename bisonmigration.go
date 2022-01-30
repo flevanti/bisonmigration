@@ -27,6 +27,7 @@ type migrationRegisteredType struct {
 	UniqueId          string
 	up                migrationFunctionSignatureType
 	down              migrationFunctionSignatureType
+	DbConnectionLabel string
 	Processed         bool
 	ProcessedTimeUnix int64
 	ProcessedBatch    int
@@ -47,6 +48,23 @@ var migrationAppDatabase string
 var migrationAppCollection string
 var migrationAppDatabaseExists bool
 var migrationAppCollectionExists bool
+
+var dbConnectionsBox = make(map[string]*mongo.Client)
+
+func RegisterDbConnection(label string, conn *mongo.Client) {
+	if _, exists := dbConnectionsBox[label]; exists {
+		fatalIfError(errors.New(fmt.Sprintf("Connection label [%s] already used", label)))
+	}
+	dbConnectionsBox[label] = conn
+}
+
+func GetConnectionsLabels() []string {
+	var l []string
+	for k, _ := range dbConnectionsBox {
+		l = append(l, k)
+	}
+	return l
+}
 
 func GetMigrationAppDatabaseExists() bool {
 	return migrationAppDatabaseExists
@@ -142,7 +160,7 @@ func GetMigrationsPendingCount() int {
 	//or
 	//- count the actual migrations marked as "pending"
 	//the second option is more reliable and always gives the number of migrations that are going to be Processed
-	return len(getMigrationsPending())
+	return len(GetMigrationsPending())
 }
 
 func GetMigrationsRegisteredCount() int {
@@ -161,14 +179,7 @@ func GetMigrationsProcessed() MigrationsProcessedType {
 	return migrationsProcessed
 }
 
-// please note that there are two versions of this function.
-// in the one exported one we remove from the migration record the functions stored
-// we don't want to expose them
 func GetMigrationsPending() MigrationsRegisteredType {
-	return getMigrationsPending()
-}
-
-func getMigrationsPending() MigrationsRegisteredType {
 	var l MigrationsRegisteredType
 	for _, record := range migrationsRegistered {
 		if !record.Processed {
@@ -178,10 +189,11 @@ func getMigrationsPending() MigrationsRegisteredType {
 	return l
 }
 
-func RegisterMigration(sequence int64, description string, upFunction migrationFunctionSignatureType, downFunction migrationFunctionSignatureType) {
+func RegisterMigration(sequence int64, description string, dbConnLabel string, upFunction migrationFunctionSignatureType, downFunction migrationFunctionSignatureType) {
 	var newMigration migrationRegisteredType
 	newMigration.Sequence = sequence
 	newMigration.Name = description
+	newMigration.DbConnectionLabel = dbConnLabel
 	newMigration.UniqueId = generateMigrationUniqueId(sequence, description)
 	newMigration.up = upFunction
 	newMigration.down = downFunction
@@ -252,4 +264,12 @@ func checkSequenceStrictnessNoLateComers() {
 
 func checkSequenceStrictnessNoDuplicates() {
 	//todo
+}
+
+func RunPendingMigratoins() error {
+
+	//todo
+
+	return nil
+
 }
