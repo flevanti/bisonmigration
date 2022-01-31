@@ -9,37 +9,50 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"log"
 	"sort"
+	"time"
 )
 
 type migrationDbRecordType struct {
-	Sequence          int64  `bson:"sequence"`
-	Name              string `bson:"name"`
-	UniqueId          string `bson:"uniqueid"`
-	ProcessedTimeUnix int64  `bson:"processedtimeunix"`
-	ProcessedBatch    int    `bson:"processedbatch"`
+	Sequence                int64  `bson:"sequence"`
+	Name                    string `bson:"name"`
+	UniqueId                string `bson:"uniqueid"`
+	ProcessedTimeUnix       int64  `bson:"processedtimeunix"`
+	ProcessedTimeSpentMs    int64  `bosn:"processedtimespentms"`
+	ProcessedBatch          int64  `bson:"processedbatch"`
+	DbConnectionLabel       string `bson:"dbconnectionlabel"`
+	DbConnectionDescription string `bson:"dbconnectiondescription"`
 }
 
 type migrationFunctionSignatureType func(db *mongo.Client) error
 
 type migrationRegisteredType struct {
-	Sequence          int64
-	Name              string
-	UniqueId          string
-	up                migrationFunctionSignatureType
-	down              migrationFunctionSignatureType
-	DbConnectionLabel string
-	Processed         bool
-	ProcessedTimeUnix int64
-	ProcessedBatch    int
+	Sequence                int64
+	Name                    string
+	UniqueId                string
+	up                      migrationFunctionSignatureType
+	down                    migrationFunctionSignatureType
+	DbConnectionLabel       string
+	DbConnectionDescription string
+	DbConnectionMissing     bool
+	Processed               bool
+	ProcessedTimeUnix       int64
+	ProcessedBatch          int64
 }
 
 type MigrationsRegisteredType []migrationRegisteredType
 type MigrationsProcessedType []migrationDbRecordType
+type DatabaseConnectionLabelType struct {
+	Label       string
+	dbClient    *mongo.Client
+	Description string
+}
 
 const MigrationAppDefaultDatabase = "migrations"
 const MigrationAppDefaultCollection = "migrations"
 const SequenceStrictnessNoDuplicates = "NODUPLICATES" //Sequence ids cannot be used more than once, they are unique (like all of us....)
 const SequenceStrictnessNoLateComers = "NOLATECOMERS" //The system won't allow processing a sequence smaller then a sequence already processed
+
+const DbConnectionLabelDefault = "*DEFAULT*"
 
 var migrationsRegistered MigrationsRegisteredType
 var migrationsProcessed MigrationsProcessedType
@@ -49,19 +62,21 @@ var migrationAppCollection string
 var migrationAppDatabaseExists bool
 var migrationAppCollectionExists bool
 
-var dbConnectionsBox = make(map[string]*mongo.Client)
+var dbConnectionsBox = make(map[string]DatabaseConnectionLabelType)
+var dbConnectionsMissing []string
 
-func RegisterDbConnection(label string, conn *mongo.Client) {
+func RegisterDbConnection(label string, description string, dbClient *mongo.Client) {
 	if _, exists := dbConnectionsBox[label]; exists {
 		fatalIfError(errors.New(fmt.Sprintf("Connection label [%s] already used", label)))
 	}
-	dbConnectionsBox[label] = conn
+	dbConnectionsBox[label] = DatabaseConnectionLabelType{Label: label, Description: description, dbClient: dbClient}
+	checkIfAllPendingMigrationsConnectionsAreRegistered()
 }
 
-func GetConnectionsLabels() []string {
-	var l []string
-	for k, _ := range dbConnectionsBox {
-		l = append(l, k)
+func GetConnectionsLabels() []DatabaseConnectionLabelType {
+	var l []DatabaseConnectionLabelType
+	for _, v := range dbConnectionsBox {
+		l = append(l, v)
 	}
 	return l
 }
@@ -75,6 +90,13 @@ func GetMigrationAppCollectionExists() bool {
 }
 
 func MigrationEngineInitialise(databaseName string, collectionName string, dbClient *mongo.Client, sequenceStrictness []string) {
+	migrationAppDatabase = databaseName
+	migrationAppCollection = collectionName
+	migrationAppMongoClient = dbClient
+
+	//register system dtabase connections
+	RegisterDbConnection(DbConnectionLabelDefault, "This is the same connection used by the migration engine", dbClient)
+
 	//At this point all migrations have been registered
 	//so we can order them by sequence instead of the way they have been registered
 	orderMigrationsRegisteredBySequence()
@@ -82,23 +104,46 @@ func MigrationEngineInitialise(databaseName string, collectionName string, dbCli
 	//Implement sequence strictness if required
 	checkSequenceStrictness(sequenceStrictness)
 
-	migrationAppDatabase = databaseName
-	migrationAppCollection = collectionName
-	migrationAppMongoClient = dbClient
-
-	RefreshDataFromDb()
+	CheckIfDbIsInitialised()
+	retrieveMigrationsProcessedFromDb()
+	markMigrationsThatArePending()
+	checkIfAllPendingMigrationsConnectionsAreRegistered()
 
 }
 
-func RefreshDataFromDb() {
+//check if the connections referenced in the pending migrations are present in the connections list available
+func checkIfAllPendingMigrationsConnectionsAreRegistered() {
+	dbConnectionsMissing = []string{}
+	for k, v := range migrationsRegistered {
+		if _, exists := dbConnectionsBox[v.DbConnectionLabel]; !exists {
+			//mark the connection as missing in a registered migration no matter if pending or not
+			migrationsRegistered[k].DbConnectionMissing = true
+			//log the missin db connection only for pending migrations
+			if !v.Processed {
+				dbConnectionsMissing = append(dbConnectionsMissing, v.DbConnectionLabel)
+			}
+		} else { //we need to set the value to false because connection could be registered later in the process and we need to update the status of the flags accordingly
+			migrationsRegistered[k].DbConnectionMissing = false
+		} // end if connection label not found in connection box
+	} //end for each registered migration
+}
+
+func GetDbConnectionsMissing() []string {
+	return dbConnectionsMissing
+}
+
+func InitialiseDatabase() {
+	if !migrationAppCollectionExists {
+		migrationAppMongoClient.Database(migrationAppDatabase).CreateCollection(context.TODO(), migrationAppCollection)
+	}
+}
+
+func CheckIfDbIsInitialised() bool {
 	migrationAppDatabaseExists = databaseExists(migrationAppDatabase)
 	if migrationAppDatabaseExists {
 		migrationAppCollectionExists = collectionExists(migrationAppDatabase, migrationAppCollection)
 	}
-	if migrationAppCollectionExists {
-		retrieveMigrationsProcessedFromDb()
-	}
-	markMigrationsThatArePending()
+	return migrationAppDatabaseExists == true && migrationAppCollectionExists == true
 }
 
 func orderMigrationsRegisteredBySequence() {
@@ -131,6 +176,9 @@ func markMigrationsThatArePending() {
 }
 
 func retrieveMigrationsProcessedFromDb() {
+	if !migrationAppCollectionExists {
+		return
+	}
 	cursor, err := migrationAppMongoClient.Database(migrationAppDatabase).Collection(migrationAppCollection).Find(context.TODO(), bson.M{})
 	var record migrationDbRecordType
 	fatalIfError(err)
@@ -142,7 +190,7 @@ func retrieveMigrationsProcessedFromDb() {
 }
 
 func collectionExists(database string, collection string) bool {
-	list, err := migrationAppMongoClient.Database(database).ListCollectionNames(context.TODO(), bson.M{"Name": collection})
+	list, err := migrationAppMongoClient.Database(database).ListCollectionNames(context.TODO(), bson.M{"name": collection})
 	fatalIfError(err)
 
 	return len(list) > 0
@@ -266,10 +314,38 @@ func checkSequenceStrictnessNoDuplicates() {
 	//todo
 }
 
-func RunPendingMigratoins() error {
-
-	//todo
+func RunPendingMigrations() error {
+	fatalIfDbNotInitialised()
+	processedBatch := time.Now().Unix()
+	for _, v := range GetMigrationsPending() {
+		recordForDb := migrationDbRecordType{}
+		startTime := time.Now()
+		err := v.up(dbConnectionsBox[v.DbConnectionLabel].dbClient)
+		if err != nil {
+			niceErr := errors.New(fmt.Sprint("Error while processing migration %s %s (sequence %d) - Migration aborted (original error: %s)", v.UniqueId, v.Name, v.Sequence, err.Error()))
+			return niceErr
+		}
+		timeSpent := time.Since(startTime).Milliseconds()
+		recordForDb.Name = v.Name
+		recordForDb.UniqueId = v.UniqueId
+		recordForDb.Sequence = v.Sequence
+		recordForDb.DbConnectionLabel = v.DbConnectionLabel
+		recordForDb.ProcessedTimeUnix = time.Now().Unix()
+		recordForDb.DbConnectionDescription = v.DbConnectionDescription
+		recordForDb.ProcessedTimeSpentMs = timeSpent
+		recordForDb.ProcessedBatch = processedBatch
+		saveProcessedMigrationToDb(recordForDb)
+	}
 
 	return nil
+}
 
+func saveProcessedMigrationToDb(record migrationDbRecordType) {
+	migrationAppMongoClient.Database(migrationAppDatabase).Collection(migrationAppCollection).InsertOne(context.TODO(), record)
+}
+
+func fatalIfDbNotInitialised() {
+	if !CheckIfDbIsInitialised() {
+		fatalIfError(errors.New("Database not initialised"))
+	}
 }
