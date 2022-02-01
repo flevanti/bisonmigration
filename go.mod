@@ -1,4 +1,4 @@
-module bison-migration
+module github.com/flevanti/bisonmigration
 
 go 1.17
 
