@@ -6,13 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"log"
 	"sort"
 	"time"
 )
 
 type migrationDbRecordType struct {
+	Mongo_Id                string `bson:"_id,omitempty"`
 	Sequence                int64  `bson:"sequence"`
 	Name                    string `bson:"name"`
 	UniqueId                string `bson:"uniqueid"`
@@ -65,6 +68,8 @@ var migrationAppCollectionExists bool
 var dbConnectionsBox = make(map[string]DatabaseConnectionLabelType)
 var dbConnectionsMissing []string
 
+var Verbose bool = true
+
 func RegisterDbConnection(label string, description string, dbClient *mongo.Client) {
 	if _, exists := dbConnectionsBox[label]; exists {
 		fatalIfError(errors.New(fmt.Sprintf("Connection label [%s] already used", label)))
@@ -109,6 +114,10 @@ func MigrationEngineInitialise(databaseName string, collectionName string, dbCli
 	markMigrationsThatArePending()
 	checkIfAllPendingMigrationsConnectionsAreRegistered()
 
+}
+
+func GetMigrationFileTemplate() string {
+	return template
 }
 
 //check if the connections referenced in the pending migrations are present in the connections list available
@@ -179,7 +188,11 @@ func retrieveMigrationsProcessedFromDb() {
 	if !migrationAppCollectionExists {
 		return
 	}
-	cursor, err := migrationAppMongoClient.Database(migrationAppDatabase).Collection(migrationAppCollection).Find(context.TODO(), bson.M{})
+	//make sure to order the migrations so that they reflect the order they have been processed
+	//mongo _id is sortable
+	queryOptions := options.FindOptions{}
+	queryOptions.SetSort(bson.M{"_id": 1})
+	cursor, err := migrationAppMongoClient.Database(migrationAppDatabase).Collection(migrationAppCollection).Find(context.TODO(), bson.M{}, &queryOptions)
 	var record migrationDbRecordType
 	fatalIfError(err)
 	for cursor.Next(context.TODO()) {
@@ -314,18 +327,27 @@ func checkSequenceStrictnessNoDuplicates() {
 	//todo
 }
 
-func RunPendingMigrations() error {
+func runPendingMigrationsInternal(howMany int, uniqueId string) error {
 	fatalIfDbNotInitialised()
 	processedBatch := time.Now().Unix()
+	var count int
 	for _, v := range GetMigrationsPending() {
+		if uniqueId != "" && v.UniqueId != uniqueId {
+			//not the migration we want
+			continue
+		}
 		recordForDb := migrationDbRecordType{}
 		startTime := time.Now()
+		printIfVerbose(fmt.Sprintf("Processing migration %s\n", v.Name))
 		err := v.up(dbConnectionsBox[v.DbConnectionLabel].dbClient)
 		if err != nil {
 			niceErr := errors.New(fmt.Sprint("Error while processing migration %s %s (sequence %d) - Migration aborted (original error: %s)", v.UniqueId, v.Name, v.Sequence, err.Error()))
 			return niceErr
 		}
 		timeSpent := time.Since(startTime).Milliseconds()
+		printIfVerbose(fmt.Sprintf("Done, it took %dms\n", timeSpent))
+		printIfVerbose("---------------------------------------------------\n")
+
 		recordForDb.Name = v.Name
 		recordForDb.UniqueId = v.UniqueId
 		recordForDb.Sequence = v.Sequence
@@ -335,9 +357,162 @@ func RunPendingMigrations() error {
 		recordForDb.ProcessedTimeSpentMs = timeSpent
 		recordForDb.ProcessedBatch = processedBatch
 		saveProcessedMigrationToDb(recordForDb)
-	}
+		count++
+		if count == howMany {
+			break
+		}
+	} //end for loop
 
 	return nil
+}
+
+func RunPendingMigrations() error {
+	return runPendingMigrationsInternal(999999, "")
+}
+
+func RunSpecificMigration(migrationUniqueId string) error {
+	if exists, _ := checkIfUniqIdPresentInRegisteredMigrations(migrationUniqueId); !exists {
+		return errors.New("Migration uniqueId not found")
+	}
+
+	return runPendingMigrationsInternal(1, migrationUniqueId)
+
+}
+
+func RunUpToSpecificMigration(migrationUniqueId string) error {
+	var howMany int
+	if exists, _ := checkIfUniqIdPresentInRegisteredMigrations(migrationUniqueId); !exists {
+		return errors.New("Migration uniqueId not found")
+	}
+
+	for _, v := range migrationsRegistered {
+		howMany++
+		if v.UniqueId == migrationUniqueId {
+			break
+		}
+	}
+	return runPendingMigrationsInternal(howMany, "")
+
+}
+
+func RunNextSingleMigration() error {
+	return runPendingMigrationsInternal(1, "")
+}
+
+func RollbackLastBatchMigrations() error {
+	var lastBatchCount int
+	var lastBatch int64
+
+	for k, v := range getMigrationsProcessedReverse() {
+		if k == 0 {
+			//first loop, consider the batch of the record what we are looking for
+			lastBatch = v.ProcessedBatch
+		}
+		if lastBatch != v.ProcessedBatch {
+			break //when the batch changes we can stop the loop... no need to go further...
+		}
+		lastBatchCount++
+	}
+
+	return rollbackMigrationsInternal(lastBatchCount, "")
+
+}
+
+func RollbackSingleLastMigration() error {
+	return rollbackMigrationsInternal(1, "")
+}
+
+func RollbackASpecificMigration(migrationUniqueId string) error {
+	if exists, _ := checkIfUniqIdPresentInProcesseddMigrations(migrationUniqueId); !exists {
+		return errors.New("Migration uniqueId not found")
+	}
+	return rollbackMigrationsInternal(1, migrationUniqueId)
+}
+
+func RollbackToSpecificMigration(migrationUniqueId string) error {
+	var howMany int
+
+	if exists, _ := checkIfUniqIdPresentInProcesseddMigrations(migrationUniqueId); !exists {
+		return errors.New("Migration uniqueId not found")
+	}
+
+	for _, v := range getMigrationsProcessedReverse() {
+		howMany++
+		if migrationUniqueId == v.UniqueId {
+			break //when the batch changes we can stop the loop... no need to go further...
+		}
+	}
+
+	return rollbackMigrationsInternal(howMany, "")
+}
+
+func rollbackMigrationsInternal(howMany int, uniqueId string) error {
+	fatalIfDbNotInitialised()
+	var count int
+	for _, v := range getMigrationsProcessedReverse() {
+		if uniqueId != "" && v.UniqueId != uniqueId {
+			//not the migration we want
+			continue
+		}
+
+		//look for the registered migration to get the up/down functions...
+
+		m, err := getRegisteredMigrationByUniqueId(v.UniqueId)
+		fatalIfError(err)
+
+		printIfVerbose(fmt.Sprintf("Rolling back migration %s \n", v.Name))
+		timeStart := time.Now()
+		err = m.down(dbConnectionsBox[m.DbConnectionLabel].dbClient)
+		if err != nil {
+			niceErr := errors.New(fmt.Sprint("Error while processing migration rollback %s %s (sequence %d) - Migration aborted (original error: %s)", m.UniqueId, m.Name, m.Sequence, err.Error()))
+			return niceErr
+		}
+		deleteMigrationByMongoId(v.Mongo_Id)
+
+		printIfVerbose(fmt.Sprintf("Done, it took %dms\n", time.Since(timeStart).Milliseconds()))
+		printIfVerbose("---------------------------------------------------\n")
+
+		count++
+		if count == howMany {
+			break
+		}
+	} //end for loop
+
+	return nil
+
+}
+
+func printIfVerbose(text string) {
+	if !Verbose {
+		return
+	}
+	fmt.Print(text)
+}
+
+func deleteMigrationByMongoId(mongo_id string) {
+	mongo_id_primitive, err := primitive.ObjectIDFromHex(mongo_id)
+	if err != nil {
+		fatalIfError(err)
+	}
+	migrationAppMongoClient.Database(migrationAppDatabase).Collection(migrationAppCollection).DeleteOne(nil, bson.M{"_id": mongo_id_primitive})
+
+}
+
+func getRegisteredMigrationByUniqueId(uniqueId string) (migrationRegisteredType, error) {
+	for _, v := range migrationsRegistered {
+		if v.UniqueId == uniqueId {
+			return v, nil
+		}
+	}
+	return migrationRegisteredType{}, errors.New(fmt.Sprint("uniqueId [%s] not found", uniqueId))
+}
+
+func getMigrationsProcessedReverse() MigrationsProcessedType {
+	var l MigrationsProcessedType
+	for i := len(migrationsProcessed) - 1; i >= 0; i-- {
+		l = append(l, migrationsProcessed[i])
+	}
+	return l
 }
 
 func saveProcessedMigrationToDb(record migrationDbRecordType) {
