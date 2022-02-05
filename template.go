@@ -15,6 +15,11 @@ import (
 // just return a nice error
 //
 
+//
+// IMPORTANT FOR SAFETY REASONS AND AVOID STUPID CONFLICTS: DO NOT CREATE EXPORTED FUNCTIONS 
+// (translated, create only functions that start with lowercase characters)
+//
+
 func up_{{sequence}}(db *mongo.Client) error {
 	// Your code here
 	return nil
